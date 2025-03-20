@@ -499,6 +499,185 @@ class SA_Epi_CrossAttention_Trans(nn.Module):
 
         return buffer
 
+###################---------Patch_Embedding---------###################
+class PatchEmbed(nn.Module):
+    r""" Image to Patch Embedding
+
+    Args:
+        img_size   (int): Image size.  Default: 224.
+        patch_size (int): Patch token size. Default: 4.
+        in_chans   (int): Number of input image channels. Default: 3.
+        embed_dim  (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
+
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.patches_resolution = patches_resolution
+        self.num_patches = patches_resolution[0] * patches_resolution[1]
+
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+
+        if norm_layer is not None:
+            self.norm = norm_layer(embed_dim)
+        else:
+            self.norm = None
+
+    def forward(self, x):     #[1, 180, 64, 64]
+        x = x.flatten(2).transpose(1, 2)  # b Ph*Pw c  #[1, 180, 64, 64]->[1, 180, 4096]->[1, 4096, 180]
+        if self.norm is not None:
+            x = self.norm(x)  #[1, 4096, 180]
+        return x
+###################---------Patch_Embedding---------###################
+
+
+###############------Rectangular_Window_Partition------###############
+def window_partition(x, window_size):   #[1, 64, 64, 180]
+    """
+    Args:
+        x: (b, h, w, c)
+        window_size (int): window size
+
+    Returns:
+        windows: (num_windows*b, window_size, window_size, c)
+    """
+    b, h, w, c = x.shape
+    x = x.view(b, h // window_size, window_size, w // window_size, window_size, c)    #[1, 64//16, 16, 64//16, 16, 180]
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, c) #[1, 64//16, 64//16, 16, 16, 180]->#[16, 16, 16, 180]
+    return windows
+###############------Rectangular_Window_Partition------###############
+
+class CFAT(nn.Module):
+    def __init__(self,
+                 img_size=64,
+                 patch_size=1,
+                 in_chans=3,
+                 embed_dim=180,
+                 depths=(8, 8, 8, 8, 8),
+                 num_heads=(6, 6, 6, 6, 6),
+                 window_size=16,
+                 shift_size = (0, 0, 8, 8, 16, 16, 24, 24),  #changed to tuple
+                 interval=(0, 2, 0, 2, 0),
+                 compress_ratio=3,
+                 squeeze_factor=30,
+                 conv_scale=0.01,
+                 overlap_ratio=0.5,
+                 mlp_ratio=2,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 drop_rate=0.,
+                 attn_drop_rate=0.,
+                 drop_path_rate=0.1,
+                 norm_layer=nn.LayerNorm,
+                 ape=False,
+                 patch_norm=True,
+                 use_checkpoint=False,
+                 upscale=4,
+                 img_range=1.,
+                 upsampler='pixelshuffle',
+                 resi_connection='1conv',
+                 **kwargs):
+        super(CFAT, self).__init__()
+
+        ##Arguments
+        self.window_size = window_size
+        self.shift_size = shift_size   #changed to tuple
+        self.overlap_ratio = overlap_ratio
+        self.upscale = upscale
+        self.upsampler = upsampler
+        self.num_layers = len(depths)  #5
+        self.embed_dim = embed_dim
+        self.ape = ape
+        self.patch_norm = patch_norm
+        self.num_features = embed_dim
+        self.mlp_ratio = mlp_ratio
+
+        num_in_ch = in_chans
+        num_out_ch = in_chans
+
+        ######----Patch_Embedding----######
+        self.patch_embed = PatchEmbed(img_size=img_size,
+                                      patch_size=patch_size,
+                                      in_chans=embed_dim,
+                                      embed_dim=embed_dim,
+                                      norm_layer=norm_layer if self.patch_norm else None)
+        num_patches = self.patch_embed.num_patches
+        patches_resolution = self.patch_embed.patches_resolution
+        self.patches_resolution = patches_resolution
+        ######----Patch_Embedding----######
+
+        ######----Absolute_Position_Embedding----######
+        if self.ape:
+            self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim)) #(1, 4096, 180)
+            trunc_normal_(self.absolute_pos_embed, std=.02)
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        ######----Absolute_Position_Embedding----######
+
+    ######----Attention_Mask_for_HAB(SW-MSA)----######
+    def calculate_mask(self, x_size, shift_size):
+        h, w = x_size
+        img_mask = torch.zeros((1, h, w, 1))  # 1 h w 1
+        h_slices = (slice(0, -self.window_size), slice(-self.window_size, -shift_size), slice(-shift_size, None))
+        w_slices = (slice(0, -self.window_size), slice(-self.window_size, -shift_size), slice(-shift_size, None))
+        cnt = 0
+        for h_s in h_slices:
+            for w_s in w_slices:
+                img_mask[:, h_s, w_s, :] = cnt
+                cnt += 1
+
+        mask_windows = window_partition(img_mask, self.window_size)  # nw, window_size, window_size, 1
+        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        return attn_mask
+    ######----Attention_Mask_for_HAB----######
+
+    ###############------Triangular_Window_Mask------###############
+    def triangle_masks(self, x):
+        ws = 2 * self.window_size
+        rows = torch.arange(ws).unsqueeze(1).repeat(1, ws)
+        cols = torch.arange(ws).unsqueeze(0).repeat(ws, 1)
+
+        upper_triangle_mask = (cols > rows) & (rows + cols < ws)
+        right_triangle_mask = (cols >= rows) & (rows + cols >= ws)
+        bottom_triangle_mask = (cols < rows) & (rows + cols >= ws - 1)
+        left_triangle_mask = (cols <= rows) & (rows + cols < ws - 1)
+
+        return [upper_triangle_mask.to(x.device), right_triangle_mask.to(x.device), bottom_triangle_mask.to(x.device),
+                left_triangle_mask.to(x.device)]
+
+    ###############------Triangular_Window_Mask------###############
+
+    def forward_feature(self, x): #[b, c, uh, vw]
+        x_size = (x.shape[2], x.shape[3])
+
+        attn_mask = tuple([self.calculate_mask(x_size, shift_size).to(x.device) for shift_size in
+                           (8, 16, 24)])  # [16, 256, 256]   #changed to tuple
+        triangular_masks = tuple(self.triangle_masks(x))  # [16, 256, 256]   #changed to tuple
+
+        params = {'attn_mask': attn_mask, 'triangular_masks': triangular_masks,
+                  'rpi_sa': self.relative_position_index_SA, 'rpi_oca': self.relative_position_index_OCA}
+
+        ##Embed$$Unembed
+        x = self.patch_embed(x)  # [1, 180, 64, 64]->[1, 4096, 180]
+        if self.ape:
+            x = x + self.absolute_pos_embed  # [1, 4096, 180]
+        x = self.pos_drop(x)  # [1, 4096, 180]
+        for layer in self.layers:
+            x = layer(x, x_size, params)  # [1, 4096, 180]
+        x = self.norm(x)  # b seq_len c     #[1, 4096, 180]
+        x = self.patch_unembed(x, x_size)  # [1, 4096, 180]->[1, 180, 64, 64]
+
+        return x
+
+
+
 class SA_Epi_Trans(nn.Module):
     def __init__(self, angRes, channels, MHSA_params):
         super(SA_Epi_Trans, self).__init__()
